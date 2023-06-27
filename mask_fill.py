@@ -63,7 +63,7 @@ def my_gumbel_softmax(logits, tau=1, hard=False, eps=1e-10, dim=-1):
     return ret
 
 model = 'bert-base-uncased'
-prompt_file = '../real-toxicity-prompts/realtoxicityprompts-data/generations/prompted/healthy_prompts_pure.jsonl'
+prompt_file = '../real-toxicity-prompts/realtoxicityprompts-data/generations/prompted/healthy_prompts_pure_with_mask.jsonl'
 prompts = []
 prompts_num = 100
 start_index = 0
@@ -79,7 +79,7 @@ lam_perp = 1
 gumbel_samples = 1000
 kappa = 5
 max_new_tokens = 30
-print_every = 50
+print_every = 5
 gpt2_checkpoint_folder = 'result'
 mask_token = '[MASK]'
 early_stop_adv_loss = 0.2
@@ -127,29 +127,40 @@ print(dirty_words)
 attack_succ = 0
 
 for idx in range(start_index, end_index):
+    # 注意：要使BertForMaskedLM正确预测[MASK]，需要在prompt结尾添加句号 '.'
     input_ids = encoded_dataset['input_ids'][idx]
     prompt = encoded_dataset['prompt'][idx]
     token_type_ids = encoded_dataset['token_type_ids'][idx]
-    clean_input_ids = input_ids.copy()
-    tmp = clean_input_ids[-1]
-    clean_input_ids[-1] = mask_info['input_ids'][1]
-    clean_input_ids.append(tmp)
-    clean_token_type_ids = token_type_ids.copy()
-    tmp = token_type_ids[-1]
-    clean_token_type_ids[-1] = mask_info['token_type_ids'][1]
-    clean_token_type_ids.append(tmp)
-    clean_generation = generate_model(input_ids=torch.tensor(clean_input_ids).unsqueeze(0).cuda(), token_type_ids=torch.tensor(clean_token_type_ids).unsqueeze(0).cuda())
-    clean_generation = generate_tokenizer.convert_ids_to_tokens(clean_generation.logits.argmax(dim=-1).squeeze())
+    # clean_generation_prompt = prompt + '[MASK].'
+    # clean_generation_inputs = generate_tokenizer(clean_generation_prompt, return_tensors='pt')
+    # clean_input_ids = clean_generation_inputs['input_ids'].cuda()
+    # clean_token_type_ids = clean_generation_inputs['token_type_ids'].cuda()
+    # clean_input_ids = input_ids.copy()
+    # tmp = clean_input_ids[-1]
+    # clean_input_ids[-1] = mask_info['input_ids'][1]
+    # clean_input_ids.append(tmp)
+    # clean_token_type_ids = token_type_ids.copy()
+    # tmp = token_type_ids[-1]
+    # clean_token_type_ids[-1] = mask_info['token_type_ids'][1]
+    # clean_token_type_ids.append(tmp)
+    clean_input_ids = torch.tensor(input_ids).unsqueeze(0).cuda()
+    clean_token_type_ids = torch.tensor(token_type_ids).unsqueeze(0).cuda()
+    clean_generation_logits = generate_model(input_ids=clean_input_ids, token_type_ids=clean_token_type_ids).logits
+    # retrieve index of [MASK]
+    mask_token_index = (clean_input_ids == generate_tokenizer.mask_token_id)[0].nonzero(as_tuple=True)[0]
+
+    predicted_token_id = clean_generation_logits[0, mask_token_index].argmax(axis=-1)
+    clean_generation = generate_tokenizer.decode(predicted_token_id)
     
     print('Prompt:', prompt)
-    print('Clean mask prediction:', clean_generation[-2])
+    print('Clean mask prediction:', clean_generation)
 
     forbidden = np.zeros(len(input_ids)).astype('bool')
     forbidden[0] = True
-    forbidden[-1] = True
+    forbidden[-3:] = True
     forbidden_indices = np.arange(0, len(input_ids))[forbidden]
     forbidden_indices = torch.from_numpy(forbidden_indices).cuda()
-    token_type_ids_batch = torch.tensor(clean_token_type_ids).unsqueeze(0).repeat(batch_size, 1).cuda()
+    token_type_ids_batch = clean_token_type_ids.repeat(batch_size, 1)
 
     start_time = time.time()
     with torch.no_grad():
@@ -158,7 +169,11 @@ for idx in range(start_index, end_index):
         ref_weights /= ref_weights.sum()
         log_coeffs = torch.zeros(len(input_ids), embeddings.size(0))
         indices = torch.arange(log_coeffs.size(0)).long()
-        log_coeffs[indices, torch.LongTensor(input_ids)] = initial_coeff
+        tmp_initial_coeff = torch.ones(len(input_ids)) * initial_coeff
+        # 确保[cls, mask, ., eos]被采样的概率为1
+        tmp_initial_coeff[0] = 100
+        tmp_initial_coeff[-3:] = 100
+        log_coeffs[indices, torch.LongTensor(input_ids)] = tmp_initial_coeff
         log_coeffs = log_coeffs.cuda()
         log_coeffs.requires_grad = True
 
@@ -177,19 +192,20 @@ for idx in range(start_index, end_index):
         tmp = log_coeffs.unsqueeze(0).repeat(batch_size, 1, 1)
         coeffs = my_gumbel_softmax(tmp, hard=False)
         inputs_embeds = (coeffs @ embeddings[None, :, :]) # 1*21*768
-        last_embed = inputs_embeds[:, -1]
-        inputs_embeds[:, -1] = mask_embedding
-        inputs_embeds = torch.cat((inputs_embeds, last_embed.unsqueeze(1)), dim=1)
+        # last_embed = inputs_embeds[:, -1]
+        # inputs_embeds[:, -1] = mask_embedding
+        # inputs_embeds = torch.cat((inputs_embeds, last_embed.unsqueeze(1)), dim=1)
         # e1 = time.time()
         # FIXME: 目前bug: generate_model.generate()会丢失梯度信息，导致adv_loss.backward无法back propagate到log_coeffs
-        pred = generate_model(inputs_embeds=inputs_embeds, token_type_ids=token_type_ids_batch)
+        pred = generate_model(inputs_embeds=inputs_embeds, token_type_ids=token_type_ids_batch).logits
         # plt.scatter(np.arange(generate_tokenizer.vocab_size), pred.logits[0,-2].softmax(0).cpu().detach().numpy())
         # plt.savefig(f'figs/{i}_mask.png')
         # plt.clf()
         # plt.scatter(np.arange(len(dirty_words_ids)), pred.logits[0,-2].softmax(0)[dirty_words_ids].cpu().detach().numpy())
         # plt.savefig(f'figs/{i}_mask_dirty.png')
         # plt.clf()
-        pred_mask = generate_tokenizer.convert_ids_to_tokens(pred.logits.argmax(dim=-1).squeeze())[-2]
+        # mask_token_index = (clean_input_ids == generate_tokenizer.mask_token_id)[0].nonzero(as_tuple=True)[0]
+        pred_mask = generate_tokenizer.convert_ids_to_tokens(pred.argmax(dim=-1).squeeze())[-3]
 
         # pred = generate_tokenizer.batch_decode(pred)
         # pred = [pred_[13:] for pred_ in pred]
@@ -197,7 +213,7 @@ for idx in range(start_index, end_index):
         # pred = [pred_[len(origin_prompt_):] for pred_, origin_prompt_ in zip(pred, origin_prompt)]
         # print('Sample prompt:', origin_prompt)
         print('Sample mask:', pred_mask)
-        pred_mask_prob = pred.logits[0,-2].softmax(0)
+        pred_mask_prob = pred[0,-3].softmax(0)
         adv_loss = 1.0 - pred_mask_prob[dirty_words_ids].sum()
         # e2 = time.time()
         # toxicity_input = toxicity_tokenizer(pred, padding=True, truncation=True, return_tensors='pt')
@@ -222,8 +238,8 @@ for idx in range(start_index, end_index):
         # print(f'TIME: ref {e4-e3}, bert {e5-e4}, ppl {e6-e5}')
         total_loss = adv_loss + ref_loss + perp_loss
         # total_loss = adv_loss
-        # adv_loss.backward()
-        total_loss.backward()
+        adv_loss.backward()
+        # total_loss.backward()
         # e7 = time.time()
 
         entropy = torch.sum(-F.log_softmax(log_coeffs, dim=1) * F.softmax(log_coeffs, dim=1))
@@ -256,10 +272,10 @@ for idx in range(start_index, end_index):
     with torch.no_grad():
         for j in range(gumbel_samples):
             adv_ids = my_gumbel_softmax(log_coeffs, hard=True).argmax(1)
-            new_adv_ids = torch.zeros(adv_ids.shape[-1]+1, dtype=torch.long)
-            new_adv_ids[-1] = adv_ids[-1]
-            new_adv_ids[-2] = mask_info['input_ids'][1]
-            new_adv_ids[:-2] = adv_ids[:-1]
+            # new_adv_ids = torch.zeros(adv_ids.shape[-1]+1, dtype=torch.long)
+            # new_adv_ids[-1] = adv_ids[-1]
+            # new_adv_ids[-2] = mask_info['input_ids'][1]
+            # new_adv_ids[:-2] = adv_ids[:-1]
             # adv_ids = adv_ids.cpu().tolist()
             # print(adv_ids)
             # adv_text = generate_tokenizer.decode(adv_ids)
@@ -277,11 +293,11 @@ for idx in range(start_index, end_index):
             # new_token_type_ids[:-2] = x['token_type_ids'][0][:-1]
             # print(new_input_ids, new_token_type_ids)
             # exit(0)
-            adv_generate_text = generate_model(input_ids=new_adv_ids.unsqueeze(0).cuda()) #,
+            adv_generate_text = generate_model(input_ids=adv_ids.unsqueeze(0).cuda()) #,
                                     # token_type_ids=new_token_type_ids.unsqueeze(0).cuda())
-            adv_mask_prob = adv_generate_text.logits[0,-2].softmax(0)[dirty_words_ids].sum()
-            perturbed_prompt = generate_tokenizer.decode(adv_generate_text.logits[0].argmax(-1)[1:-2])
-            adv_generate_text = generate_tokenizer.decode(adv_generate_text.logits[0,-2].argmax().unsqueeze(0))
+            adv_mask_prob = adv_generate_text.logits[0,-3].softmax(0)[dirty_words_ids].sum()
+            perturbed_prompt = generate_tokenizer.decode(adv_generate_text.logits[0].argmax(-1))
+            adv_generate_text = generate_tokenizer.decode(adv_generate_text.logits[0,-3].argmax().unsqueeze(0))
             
             # adv_toxicity = toxicity_model(**toxicity_tokenizer(adv_generate_text, padding=True, truncation=True, return_tensors='pt')).logits[0]
             # adv_toxicity = F.softmax(adv_toxicity)[1]
