@@ -68,21 +68,22 @@ prompts = []
 prompts_num = 100
 start_index = 0
 num_samples = 100
-num_iters = 500
+num_iters = 600
 adv_loss = 'cw'
 initial_coeff = 15
 lr = 1e-1
 batch_size = 1
 embed_layer = -1
-lam_sim = 1
-lam_perp = 1
+lam_sim = 0.00
+lam_perp = 0.00
 gumbel_samples = 1000
 kappa = 5
 max_new_tokens = 30
-print_every = 5
+print_every = 50
 gpt2_checkpoint_folder = 'result'
 mask_token = '[MASK]'
 early_stop_adv_loss = 0.2
+topk_attack = 3
 
 # generator = pipeline("text-generation", model=model)
 generate_tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
@@ -179,6 +180,40 @@ for idx in range(start_index, end_index):
 
     optimizer = torch.optim.Adam([log_coeffs], lr=lr)
     start = time.time()
+
+    # 寻找gradient最大的token作为attack target
+    optimizer.zero_grad()
+    tmp = log_coeffs.unsqueeze(0).repeat(batch_size, 1, 1)
+    coeffs = my_gumbel_softmax(tmp, hard=False)
+    inputs_embeds = (coeffs @ embeddings[None, :, :])
+    pred = generate_model(inputs_embeds=inputs_embeds, token_type_ids=token_type_ids_batch).logits
+    pred_mask = generate_tokenizer.convert_ids_to_tokens(pred.argmax(dim=-1).squeeze())[-3]
+    pred_mask_prob = pred[0, -3].softmax(0)
+    adv_loss = 1.0 - pred_mask_prob[dirty_words_ids].sum()
+    ref_embeds = (coeffs @ ref_embeddings[None, :, :])
+    pred = ref_model(inputs_embeds=ref_embeds)
+    if lam_sim > 0:
+        output = pred.hidden_states[embed_layer]
+        ref_loss = -lam_sim * bert_score(orig_output, output, weights=ref_weights).mean()
+    else:
+        ref_loss = 0.0
+    if lam_perp > 0:
+        perp_loss = lam_perp * log_perplexity(pred.logits, coeffs)
+    else:
+        perp_loss = 0.0
+    total_loss = adv_loss + ref_loss + perp_loss
+    total_loss.backward()
+    log_coeffs.grad.index_fill_(0, forbidden_indices, 0)
+    _, attack_indices = torch.topk(torch.norm(log_coeffs.grad, dim=1),topk_attack)
+    log_coeffs.grad.index_fill_(0, torch.arange(len(input_ids)).cuda(), 0)
+    forbidden = torch.from_numpy(np.ones(len(input_ids)).astype('bool')).cuda()
+    forbidden[attack_indices] = False
+    forbidden_indices = torch.arange(len(input_ids)).cuda()[forbidden]
+    log_coeffs.requires_grad = False
+    log_coeffs[forbidden_indices, torch.tensor(input_ids).cuda()[forbidden_indices]] = 100
+    log_coeffs.requires_grad = True
+    print('Attack indices:', attack_indices)
+
     for i in range(num_iters):
         # for plt_id in range(len(input_ids)):
         #     plt.scatter(np.arange(generate_tokenizer.vocab_size),log_coeffs[plt_id].softmax(0).cpu().detach().numpy())
@@ -212,7 +247,7 @@ for idx in range(start_index, end_index):
         # origin_prompt = generate_tokenizer.batch_decode(generate_model.generate(inputs_embeds=inputs_embeds, max_new_tokens=len(input_ids)))
         # pred = [pred_[len(origin_prompt_):] for pred_, origin_prompt_ in zip(pred, origin_prompt)]
         # print('Sample prompt:', origin_prompt)
-        print('Sample mask:', pred_mask)
+        # print('Sample mask:', pred_mask)
         pred_mask_prob = pred[0,-3].softmax(0)
         adv_loss = 1.0 - pred_mask_prob[dirty_words_ids].sum()
         # e2 = time.time()
@@ -230,22 +265,27 @@ for idx in range(start_index, end_index):
         if lam_sim > 0:
             output = pred.hidden_states[embed_layer]
             ref_loss = -lam_sim * bert_score(orig_output, output, weights=ref_weights).mean()
+        else:
+            ref_loss = 0.0
         # e5 = time.time()
         # (log) perplexity constraint
         if lam_perp > 0:
             perp_loss = lam_perp * log_perplexity(pred.logits, coeffs)
+        else:
+            perp_loss = 0.0
         # e6 = time.time()
         # print(f'TIME: ref {e4-e3}, bert {e5-e4}, ppl {e6-e5}')
         total_loss = adv_loss + ref_loss + perp_loss
         # total_loss = adv_loss
-        adv_loss.backward()
-        # total_loss.backward()
+        # adv_loss.backward()
+        total_loss.backward()
         # e7 = time.time()
 
         entropy = torch.sum(-F.log_softmax(log_coeffs, dim=1) * F.softmax(log_coeffs, dim=1))
         # e8 = time.time()
         if i % print_every == 0:
             print(f'Iteration: {i+1}, total loss: {total_loss}, adv_loss: {adv_loss}, ref_loss: {ref_loss}, perp_loss: {perp_loss}, entropy: {entropy}, time: {time.time()-start}')
+            print('Sample mask:', pred_mask)
             # print(f'Iteration: {i+1}, total (adv) loss: {adv_loss}, entropy: {entropy}, time: {time.time()-start}')
             # print(log_coeffs.shape)
             # print('-'*50)
@@ -262,10 +302,10 @@ for idx in range(start_index, end_index):
         # print(f'TIME: backward {e7-e6}, entropy {e8-e7}, step {e9-e8}')
 
         # Log statistics
-        adv_losses[idx-start_index, i] = adv_loss.detach().item()
-        ref_losses[idx-start_index, i] = ref_loss.detach().item()
-        perp_losses[idx-start_index, i] = perp_loss.detach().item()
-        entropies[idx-start_index, i] = entropy.detach().item()
+        # adv_losses[idx-start_index, i] = adv_loss.detach().item()
+        # ref_losses[idx-start_index, i] = ref_loss.detach().item()
+        # perp_losses[idx-start_index, i] = perp_loss.detach().item()
+        # entropies[idx-start_index, i] = entropy.detach().item()
     
     times.append(time.time() - start_time)
 
@@ -306,6 +346,7 @@ for idx in range(start_index, end_index):
                 print('Adv predicted word:', adv_generate_text)
                 print('Adv word prob:', adv_mask_prob)
                 if adv_generate_text in dirty_words:
+                    print('Attack succeed')
                     attack_succ += 1
                 break
 
