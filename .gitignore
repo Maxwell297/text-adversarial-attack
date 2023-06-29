@@ -1,0 +1,15 @@
+figs/
+logs/
+result/
+checkpoint/
+*.out*
+.git.bk/
+adv_samples/
+__pycache__/
+wandb/
+a.py
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+run.sh
+data/dbpedia_csv/
+data/healthy_prompts.jsonl

@@ -12,4 +12,4 @@
 
 # python text_classification.py --data_folder=data --dataset=mnli --finetune=True > logs/text_classification.log
 # python evaluate_adv_samples.py --data_folder=data --dataset=mnli --finetune=True --start_index=0 --num_samples=100 --end_index=100 --gumbel_samples=1000 > logs/transfer_attack.log
-python mask_fill.py > logs/mask_fill_total_loss.log
+python mask_fill.py > logs/mask_fill_adv_loss_top-3.log
